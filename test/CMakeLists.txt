@@ -1,0 +1,16 @@
+project(RK1108_CVR)
+cmake_minimum_required(VERSION 2.8.12)
+set_property(GLOBAL PROPERTY TARGET_SUPPORTS_SHARED_LIBS TRUE)
+
+set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_C_FLAGS_DEBUG "-g -rdynamic -ldl -funwind-tables -fPIC -O0")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -rdynamic -ldl -funwind-tables -fPIC -O0")
+
+add_subdirectory(app/wlan_service)
+add_subdirectory(external/librkipc)
+add_subdirectory(external/libion)
+add_subdirectory(external/io)
+add_subdirectory(external/dpp)
+add_subdirectory(external/adb)
+add_subdirectory(external/libcutils)
+add_subdirectory(external/fsck_msdos)

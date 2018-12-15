@@ -1,0 +1,363 @@
+#if !HAVE_GUI
+
+extern "C" {
+#include "parameter.h"
+}
+#include "video_interface.h"
+#include "av_wrapper/encoder_muxing/muxing/custom_muxer.h"
+
+/*****************************dd pai*****************************/
+
+#if DEBUG
+extern "C" void init_dump(void);
+#endif
+
+static int sensor_init(MediaHandle* handle, SensorAttr* sensor_attr) {
+  static struct rk_cams_dev_info cam_infos = {0};
+  struct Video* video = (struct Video*)handle->video_node;
+  bool exist = false;
+
+  CamHwItf::getCameraInfos(&cam_infos);
+
+  video->width = sensor_attr->width;
+  video->height = sensor_attr->height;
+  video->fps = sensor_attr->fps;
+  video->fps_n = 1;
+  video->fps_d = sensor_attr->fps;
+  video->frmFmt = {
+      .frmSize = {(unsigned int)video->width, (unsigned int)video->height},
+      .frmFmt = HAL_FRMAE_FMT_NV12,
+      .fps = (unsigned int)video->fps};
+  parameter_save_video_frontcamera_fps(sensor_attr->fps);
+  struct JpegConfig& jpeg_config = video->jpeg_config[0];
+  jpeg_config.width = sensor_attr->width;
+  jpeg_config.height = sensor_attr->height;
+
+  video->hal = new hal();
+  if (!video->hal) {
+    printf("no memory!\n");
+    return -1;
+  }
+
+  video->hal->dev = getCamHwItf(&(cam_infos.isp_dev));
+  if (!video->hal->dev.get()) {
+    printf("no memory!\n");
+    return -1;
+  }
+
+  for (int i = 0; i < cam_infos.num_camers; i++) {
+    if (cam_infos.cam[i]->type == RK_CAM_ATTACHED_TO_ISP) {
+      printf("connected isp camera name %s,input id %d\n",
+             cam_infos.cam[i]->name, cam_infos.cam[i]->index);
+      if (video->hal->dev->initHw(cam_infos.cam[i]->index) == false) {
+        printf("video%d init fail!\n", i);
+        return -1;
+      }
+      video->deviceid = i;
+      video->type = VIDEO_TYPE_ISP;
+      exist = true;
+      break;
+    }
+  }
+
+  if (!exist) {
+    printf("isp not exist!\n");
+    return -1;
+  }
+
+  if (video_set_power_line_frequency(video, sensor_attr->freq == 50 ? 1 : 2))
+    return -1;
+
+  return 0;
+}
+
+int media_sys_init(MediaHandle* handle, SensorAttr* sensor_attr) {
+  int ret = 0;
+  if (!handle || !sensor_attr) {
+    printf("invalid input parameter\n");
+    return -1;
+  }
+  parameter_init();
+  system("echo 0 > /proc/sys/vm/overcommit_memory");
+#if DEBUG
+  init_dump();
+#endif
+  PRINTF_FUNC_LINE;
+  pthread_mutex_init(&notelock, NULL);
+  if (pthread_attr_init(&global_attr)) {
+    printf("pthread_attr_init failed!\n");
+    return -1;
+  }
+  PRINTF_FUNC_LINE;
+  if (pthread_attr_setstacksize(&global_attr, STACKSIZE)) {
+    printf("pthread_attr_setstacksize failed!\n");
+    return -1;
+  }
+  PRINTF_FUNC_LINE;
+  with_mp = true;
+  with_sp = false;
+  PRINTF_FUNC_LINE;
+#if HAVE_GUI
+  video_rkfb_get_resolution((int*)&fb_width, (int*)&fb_height);
+  if (fb_width < fb_height) {
+    unsigned int temp = fb_width;
+    fb_width = fb_height;
+    fb_height = temp;
+  }
+  fb_width = (fb_width + 15) & (~15);
+  fb_height = (fb_height + 15) & (~15);
+#endif
+  PRINTF_FUNC_LINE;
+  struct Video* video = (struct Video*)calloc(1, sizeof(struct Video));
+  if (!video) {
+    printf("no memory!\n");
+    return -1;
+  }
+  handle->video_node = video;
+  video->pthread_run = 1;
+  video->save_en = 1;
+  video->pre = 0;
+  video->next = 0;
+  // video->display = true;
+  video->front = true;
+  pthread_mutex_init(&video->record_mutex, NULL);
+  pthread_cond_init(&video->record_cond, NULL);
+
+  ret = sensor_init(handle, sensor_attr);
+  if (ret) {
+    printf("sensor_attr init fail!\n");
+    return -1;
+  }
+
+  if (video_encode_init(video))
+    return -1;
+
+  if ((video->disp.rga_fd = rk_rga_open()) <= 0)
+    return -1;
+
+  if (video_dpp_init(video))
+    return -1;
+
+  if (isp_video_path(video))
+    return -1;
+
+  if (isp_video_start(video))
+    return -1;
+  PRINTF_FUNC_LINE;
+  return 0;
+}
+
+int media_sys_uninit(MediaHandle* handle) {
+  if (!handle)
+    return -1;
+  struct Video* video = (struct Video*)handle->video_node;
+  if (!video)
+    return -1;
+  video->pthread_run = 0;
+  video_ion_free(&video->disp.yuyv);
+  video_encode_exit(video);
+
+  if (video->hal) {
+    isp_video_deinit(video);
+    delete video->hal;
+    video->hal = NULL;
+  }
+
+  video_dpp_exit(video);
+
+  rk_rga_close(video->disp.rga_fd);
+
+  handle->video_node = NULL;
+
+  if (pthread_attr_destroy(&global_attr))
+    printf("pthread_attr_destroy failed!\n");
+
+  return 0;
+}
+
+#define CHECK_CHANNEL(ERRCODE)            \
+  do {                                    \
+    if (channel < 0 || channel > 3) {     \
+      printf("invalid channel number\n"); \
+      return ERRCODE;                     \
+    }                                     \
+  } while (0)
+
+static inline int get_h264_encoder_id(int channel) {
+  return channel == 0 ? EncodeHandler::H264_ENCODER_ID
+                      : EncodeHandler::SCALED_H264_ENCODER_ID;
+}
+
+static inline video_encode_config& get_h264_config(struct Video* video,
+                                                   int channel) {
+  return channel == 0 ? video->encode_handler->common_config
+                      : video->encode_handler->scale_h264_config;
+}
+
+int create_enc_stream_receiver(MediaHandle* handle,
+                               int channel,
+                               void** out_receiver,
+                               NotifyNewEncStream new_stream_cb) {
+  if (!handle || !out_receiver || !new_stream_cb) {
+    printf("invalid input parameter\n");
+    return -1;
+  }
+  CHECK_CHANNEL(-1);
+  if (*out_receiver) {
+    printf("error: receiver is not null\n");
+    return -1;
+  }
+  struct Video* video = static_cast<struct Video*>(handle->video_node);
+  if (channel < 2) {
+    CustomMuxer* muxer = CustomMuxer::create();
+    if (!muxer) {
+      printf("no memory\n");
+      return -1;
+    }
+    muxer->set_notify_new_enc_stream_callback(new_stream_cb);
+    *out_receiver = muxer;
+    video->encode_handler->send_attach_user_muxer(muxer, (char*)"dingding", 1,
+                                                  get_h264_encoder_id(channel));
+  } else {
+    if (video->jpeg_receiver[channel - 2]) {
+      printf("channel %d already has a receiver\n", channel);
+      return -1;
+    }
+    JpegStreamReceiver* jpeg_receiver = new JpegStreamReceiver();
+    if (!jpeg_receiver) {
+      printf("no memory\n");
+      return -1;
+    }
+    jpeg_receiver->set_notify_new_enc_stream_callback(new_stream_cb);
+    *out_receiver = jpeg_receiver;
+    video->jpeg_receiver[channel - 2] = jpeg_receiver;
+  }
+  return 0;
+}
+
+void destroy_enc_stream_receiver(MediaHandle* handle,
+                                 int channel,
+                                 void* receiver) {
+  if (!handle || !receiver)
+    return;
+  CHECK_CHANNEL();
+  struct Video* video = static_cast<struct Video*>(handle->video_node);
+  if (channel < 2) {
+    CustomMuxer* muxer = static_cast<CustomMuxer*>(receiver);
+    video->encode_handler->sync_detach_user_muxer(muxer,
+                                                  get_h264_encoder_id(channel));
+    delete muxer;
+  } else {
+    JpegStreamReceiver* jpeg_receiver =
+        static_cast<JpegStreamReceiver*>(receiver);
+    if (video->jpeg_receiver[channel - 2] != jpeg_receiver) {
+      printf("input receiver is not mapped in mediasys\n");
+      return;
+    }
+    video->jpeg_receiver[channel - 2] = NULL;
+    delete jpeg_receiver;  // not safe, video.cpp has not a thread queue
+  }
+}
+
+int venc_set_resolution(MediaHandle* handle,
+                        int channel,
+                        int width,
+                        int height) {
+  CHECK_CHANNEL(-1);
+  struct Video* video = static_cast<struct Video*>(handle->video_node);
+  if (channel == 1) {
+    video_encode_config& config = get_h264_config(video, channel);
+
+    config.width = width;
+    config.height = height;
+  } else if (channel == 3) {
+    struct JpegConfig& jpeg_config = video->jpeg_config[channel - 2];
+    jpeg_config.width = width;
+    jpeg_config.height = height;
+  }
+  return 0;
+}
+
+int venc_set_frame_rate(MediaHandle* handle, int channel, int frame_rate) {
+  CHECK_CHANNEL(-1);
+  if (frame_rate < 1 || frame_rate > 60) {
+    printf("invalid frame_rate value\n");
+    return -1;
+  }
+  struct Video* video = static_cast<struct Video*>(handle->video_node);
+  if (channel < 2) {
+    video_encode_config& config = get_h264_config(video, channel);
+    config.stream_frame_rate = frame_rate;
+  }
+  return 0;
+}
+
+int venc_set_bit_rate(MediaHandle* handle, int channel, int bit_rate) {
+  CHECK_CHANNEL(-1);
+  struct Video* video = static_cast<struct Video*>(handle->video_node);
+  if (channel < 2) {
+    video_encode_config& config = get_h264_config(video, channel);
+    config.video_bit_rate = bit_rate;
+  }
+  return 0;
+}
+
+int venc_set_gop_size(MediaHandle* handle, int channel, int gop_size) {
+  CHECK_CHANNEL(-1);
+  struct Video* video = static_cast<struct Video*>(handle->video_node);
+  if (channel < 2) {
+    video_encode_config& config = get_h264_config(video, channel);
+    config.video_gop_size = gop_size;
+  }
+  return 0;
+}
+
+int venc_set_profile(MediaHandle* handle, int channel, int profile) {
+  CHECK_CHANNEL(-1);
+  struct Video* video = static_cast<struct Video*>(handle->video_node);
+  if (channel < 2) {
+    video_encode_config& config = get_h264_config(video, channel);
+    config.video_profile = profile;
+  }
+  return 0;
+}
+
+// start encoding frame on channel xx, and passing to receiver
+int venc_start_stream(MediaHandle* handle, int channel) {
+  CHECK_CHANNEL(-1);
+  struct Video* video = static_cast<struct Video*>(handle->video_node);
+  if (channel < 2)
+    video->encode_handler->send_encoder_start(get_h264_encoder_id(channel));
+  return 0;
+}
+
+// stop encoding frame on channel xx, no need venc_destroy interface
+int venc_stop_stream(MediaHandle* handle, int channel) {
+  CHECK_CHANNEL(-1);
+  struct Video* video = static_cast<struct Video*>(handle->video_node);
+  if (channel < 2)
+    video->encode_handler->send_encoder_stop(get_h264_encoder_id(channel));
+  return 0;
+}
+
+// force generating an idr frame
+int venc_require_an_idr(MediaHandle* handle, int channel) {
+  CHECK_CHANNEL(-1);
+  struct Video* video = static_cast<struct Video*>(handle->video_node);
+  if (channel < 2)
+    video->encode_handler->send_gen_idr_frame(get_h264_encoder_id(channel));
+  return 0;
+}
+
+int jpegenc_request_encode_one_frame(MediaHandle* handle, int channel) {
+  CHECK_CHANNEL(-1);
+  struct Video* video = static_cast<struct Video*>(handle->video_node);
+  if (channel > 1) {
+    JpegStreamReceiver* jpeg_receiver = video->jpeg_receiver[channel - 2];
+    if (jpeg_receiver)
+      jpeg_receiver->set_request_encode(true);
+  }
+  return 0;
+}
+
+#endif
